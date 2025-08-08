@@ -2,10 +2,12 @@ import os
 import sys
 import subprocess
 import shlex
+import re
+from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QTreeWidget, QTreeWidgetItem, 
                              QLabel, QFileDialog, QLineEdit, QGroupBox, QTabWidget,
-                             QTextEdit, QSplitter, QScrollArea, QListWidget)
+                             QTextEdit, QSplitter, QScrollArea, QListWidget, QGridLayout, QHeaderView)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 
@@ -101,37 +103,64 @@ class PartitionDumper(QWidget):
         self.partition_tab.setLayout(layout)
 
     def setup_device_info_tab(self):
-        """Setup device information display with organized categories."""
+        """Modern device info UI: Overview + Filter + Categorized tree + Copy/Export."""
         layout = QVBoxLayout()
-        
-        # Top button for copying all getprop output
-        copy_all_button = QPushButton("Copy All Device Properties to Clipboard")
-        copy_all_button.clicked.connect(self.copy_all_properties)
-        layout.addWidget(copy_all_button)
-        
-        # Create scroll area for property lists
-        scroll_area = QScrollArea()
-        scroll_widget = QWidget()
-        scroll_layout = QVBoxLayout(scroll_widget)
-        
-        # Create splitter for organized property lists
-        splitter = QSplitter(Qt.Horizontal)
-        
-        # Property lists will be populated dynamically
-        self.property_lists = {}
-        
-        splitter_widget = QWidget()
-        splitter_layout = QHBoxLayout(splitter_widget)
-        splitter_layout.addWidget(splitter)
-        
-        scroll_layout.addWidget(splitter_widget)
-        scroll_area.setWidget(scroll_widget)
-        scroll_area.setWidgetResizable(True)
-        layout.addWidget(scroll_area)
-        
-        # Store references for later use
-        self.splitter = splitter
-        
+
+        # Overview group
+        self.overview_group = QGroupBox("Overview")
+        grid = QGridLayout()
+        self.overview_fields = [
+            "Model", "Manufacturer", "Android", "Security Patch",
+            "Build ID", "Build Display", "Fingerprint",
+            "Device", "Name", "Board",
+            "Bootloader", "Baseband", "Serial",
+            "LineageOS", "Treble", "ADB Root"
+        ]
+        self.overview_labels = {}
+        for i, field in enumerate(self.overview_fields):
+            grid.addWidget(QLabel(f"{field}:"), i, 0, alignment=Qt.AlignRight)
+            val_lbl = QLabel("")
+            val_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            self.overview_labels[field] = val_lbl
+            grid.addWidget(val_lbl, i, 1)
+        self.overview_group.setLayout(grid)
+        layout.addWidget(self.overview_group)
+
+        # Toolbar: filter + actions
+        tool = QHBoxLayout()
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText("Filter properties (substring or regex)...")
+        self.filter_edit.textChanged.connect(self.apply_property_filter)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.load_device_info)
+        copy_overview_btn = QPushButton("Copy Overview")
+        copy_overview_btn.clicked.connect(self.copy_overview)
+        copy_filtered_btn = QPushButton("Copy Filtered")
+        copy_filtered_btn.clicked.connect(self.copy_filtered_properties)
+        copy_all_btn = QPushButton("Copy All")
+        copy_all_btn.clicked.connect(self.copy_all_properties)
+        export_btn = QPushButton("Export...")
+        export_btn.clicked.connect(self.export_properties)
+
+        tool.addWidget(QLabel("Filter:"))
+        tool.addWidget(self.filter_edit)
+        tool.addWidget(refresh_btn)
+        tool.addStretch(1)
+        tool.addWidget(copy_overview_btn)
+        tool.addWidget(copy_filtered_btn)
+        tool.addWidget(copy_all_btn)
+        tool.addWidget(export_btn)
+        layout.addLayout(tool)
+
+        # Categorized properties tree
+        self.props_tree = QTreeWidget()
+        self.props_tree.setHeaderLabels(["Property", "Value"])
+        self.props_tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.props_tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.props_tree.setUniformRowHeights(True)
+        self.props_tree.setAlternatingRowColors(True)
+        layout.addWidget(self.props_tree)
+
         self.device_info_tab.setLayout(layout)
 
     def create_property_list(self, category_name, properties):
@@ -417,57 +446,202 @@ class PartitionDumper(QWidget):
             self.resize(800, 600)
 
     def load_device_info(self):
-        """Load device properties and organize by ro.* subkeys."""
+        """Fetch, parse, summarize, categorize, and render device properties."""
+        def _post_load(all_props_text):
+            self.all_properties = all_props_text
+            props = self.parse_getprop_output(all_props_text)
+            self.populate_overview(props)
+            self.populate_properties_tree(props)
+            # Apply current filter (if any)
+            self.apply_property_filter()
+
         try:
-            # Get all properties
-            result = subprocess.run(['adb', 'shell', 'getprop'], 
-                                  capture_output=True, text=True, check=True)
-            all_props = result.stdout
-            
-            # Parse properties into dictionary
-            props_dict = {}
-            for line in all_props.strip().split('\n'):
-                if line.startswith('[') and ']: [' in line:
-                    key = line.split(']: [')[0][1:]
-                    value = line.split(']: [')[1].rstrip(']')
-                    props_dict[key] = f"{key}: {value}"
-            
-            # Organize properties by ro.* subkeys
-            organized_props = {}
-            for key, formatted_prop in props_dict.items():
-                if key.startswith('ro.'):
-                    # Extract the subkey (e.g., "ro.product" from "ro.product.model")
-                    parts = key.split('.')
-                    if len(parts) >= 2:
-                        subkey = f"{parts[0]}.{parts[1]}"  # e.g., "ro.product"
-                        if subkey not in organized_props:
-                            organized_props[subkey] = []
-                        organized_props[subkey].append(formatted_prop)
-                else:
-                    # Non-ro properties go in "Other"
-                    if "Other" not in organized_props:
-                        organized_props["Other"] = []
-                    organized_props["Other"].append(formatted_prop)
-            
-            # Clear existing widgets from splitter
-            for i in reversed(range(self.splitter.count())):
-                child = self.splitter.widget(i)
-                if child:
-                    child.setParent(None)
-            
-            # Create list widgets for each category
-            for category in sorted(organized_props.keys()):
-                properties = sorted(organized_props[category])
-                group_widget = self.create_property_list(category, properties)
-                self.splitter.addWidget(group_widget)
-            
-            # Store all properties for full copy function
-            self.all_properties = all_props
-            
-        except subprocess.CalledProcessError as e:
-            # Create error display
-            error_group = self.create_property_list("Error", [f"Error loading properties: {str(e)}"])
-            self.splitter.addWidget(error_group)
+            result = subprocess.run(['adb', 'shell', 'getprop'],
+                                    capture_output=True, text=True, check=True)
+            _post_load(result.stdout)
+        except subprocess.CalledProcessError:
+            # Fallback to local sample if ADB fails
+            try:
+                fallback_path = os.path.join(os.path.dirname(__file__), 'adb_shell_getprop.output')
+                with open(fallback_path, 'r', encoding='utf-8') as f:
+                    _post_load(f.read())
+            except Exception as e:
+                # Minimal error display
+                self.props_tree.clear()
+                root = QTreeWidgetItem(["Error", f"Failed to load properties: {str(e)}"])
+                self.props_tree.addTopLevelItem(root)
+                self.all_properties = "Error loading properties."
+
+    # Helpers: parsing and categorization
+
+    def parse_getprop_output(self, text):
+        """Parse adb shell getprop output into dict."""
+        props = {}
+        for line in text.strip().splitlines():
+            if line.startswith('[') and ']: [' in line:
+                key = line.split(']: [', 1)[0][1:]
+                value = line.split(']: [', 1)[1].rstrip(']')
+                props[key] = value
+        return props
+
+    def get_prop(self, props, keys, default=""):
+        """Return first non-empty/non-unknown value for keys."""
+        for k in keys:
+            v = props.get(k, "").strip()
+            if v and v.lower() not in ("unknown",):
+                return v
+        return default
+
+    def populate_overview(self, props):
+        """Compute and fill the overview grid."""
+        android = self.get_prop(props, ['ro.build.version.release'])
+        sdk = self.get_prop(props, ['ro.build.version.sdk'])
+        android_display = f"{android} (SDK {sdk})" if android or sdk else ""
+
+        adb_root_raw = self.get_prop(props, ['service.adb.root', 'init.svc.adb_root'])
+        adb_root = "Yes" if adb_root_raw in ("1", "running", "true", "True") else ("No" if adb_root_raw else "")
+
+        overview = {
+            "Model": self.get_prop(props, ['ro.product.model', 'ro.product.system.model', 'ro.product.vendor.model', 'ro.product.odm.model'], "Unknown"),
+            "Manufacturer": self.get_prop(props, ['ro.product.manufacturer', 'ro.product.vendor.manufacturer']),
+            "Android": android_display,
+            "Security Patch": self.get_prop(props, ['ro.build.version.security_patch']),
+            "Build ID": self.get_prop(props, ['ro.build.id']),
+            "Build Display": self.get_prop(props, ['ro.build.display.id']),
+            "Fingerprint": self.get_prop(props, ['ro.build.fingerprint']),
+            "Device": self.get_prop(props, ['ro.product.device']),
+            "Name": self.get_prop(props, ['ro.product.name']),
+            "Board": self.get_prop(props, ['ro.product.board', 'ro.board.platform']),
+            "Bootloader": self.get_prop(props, ['ro.bootloader', 'ro.boot.bootloader']),
+            "Baseband": self.get_prop(props, ['gsm.version.baseband']),
+            "Serial": self.get_prop(props, ['ro.serialno', 'ro.boot.serialno']),
+            "LineageOS": self.get_prop(props, ['ro.lineage.display.version', 'ro.modversion', 'ro.lineage.version']),
+            "Treble": self.get_prop(props, ['ro.treble.enabled']),
+            "ADB Root": adb_root,
+        }
+
+        for field in self.overview_fields:
+            val = overview.get(field, "")
+            self.overview_labels[field].setText(val)
+
+    def categorize_property(self, key):
+        """Heuristic category for a given prop key."""
+        # Ordered checks from most specific to general
+        if key.startswith(('ro.build.', 'build.', 'ro.system.build.', 'ro.vendor.build.', 'ro.odm.build.', 'ro.product.build.')):
+            return "Build"
+        if key.startswith(('ro.product.',)):
+            return "Product"
+        if key.startswith(('ro.vendor.', 'vendor.')):
+            return "Vendor"
+        if key.startswith(('ro.boot', 'ro.bootloader', 'boot.', 'init.svc', 'init.svc_debug_pid', 'ro.boottime.', 'service.bootanim')):
+            return "Boot"
+        if key.startswith(('dalvik.', 'pm.dexopt', 'ro.zygote', 'sys.system_server', 'sys.boot', 'sys.use_memfd', 'ro.runtime.', 'tombstoned.')):
+            return "Runtime/ART"
+        if key.startswith(('ril.', 'gsm.', 'telephony.', 'ro.telephony.', 'keyguard.')):
+            return "Radio/Telephony"
+        if key.startswith(('net.', 'wifi.', 'wlan.', 'dhcp.', 'ro.wifi.', 'wificond', 'wifi.', 'netd', 'ro.opengles.')):
+            return "Network/Wi‑Fi"
+        if key.startswith(('usb.', 'sys.usb.', 'persist.sys.usb.', 'ro.usb.', 'vendor.usb.', 'init.svc.vendor.usb')):
+            return "USB"
+        if key.startswith(('bluetooth', 'bt.', 'vendor.bluetooth', 'persist.bluetooth', 'net.bt.')):
+            return "Bluetooth"
+        if key.startswith(('audio.', 'media.', 'vendor.audio', 'av.offload', 'qcom.audio.', 'log.tag.APM_AudioPolicyManager', 'media.recorder.')):
+            return "Audio/Media"
+        if key.startswith(('graphics.', 'debug.sf.', 'ro.hwui.', 'vendor.hwcomposer', 'gralloc', 'ro.sf.')):
+            return "Graphics/Display"
+        if key.startswith(('nfc.', 'ro.nfc.')):
+            return "NFC"
+        if key.startswith(('vold.', 'ro.crypto', 'ro.storage', 'selinux.restorecon_recursive')) or 'fstab' in key or key.endswith('.fsck'):
+            return "Storage/FS"
+        if key.startswith(('service.', 'hwservicemanager', 'servicemanager', 'vndservicemanager', 'ro.persistent_properties')):
+            return "Services/Daemons"
+        if key.startswith(('security.', 'selinux.', 'ro.secure', 'ro.secwvk', 'ro.control_privapp_permissions')):
+            return "Security"
+        if key.startswith(('persist.', 'debug.', 'log.', 'logd.', 'ro.logd.')):
+            return "Debug/Logging"
+        if key.startswith('ro.'):
+            return "System (ro.*)"
+        return "Other"
+
+    def populate_properties_tree(self, props):
+        """Fill the tree with categorized properties."""
+        self.props_tree.clear()
+        categories = {}
+        for k, v in props.items():
+            cat = self.categorize_property(k)
+            categories.setdefault(cat, []).append((k, v))
+
+        for cat in sorted(categories.keys()):
+            parent = QTreeWidgetItem([cat, ""])
+            parent.setFlags(parent.flags() & ~Qt.ItemIsSelectable)
+            self.props_tree.addTopLevelItem(parent)
+            for k, v in sorted(categories[cat], key=lambda x: x[0].lower()):
+                child = QTreeWidgetItem([k, v])
+                parent.addChild(child)
+            parent.setExpanded(True)
+
+    def apply_property_filter(self):
+        """Filter visible rows by substring or regex on key/value."""
+        pattern = self.filter_edit.text().strip()
+        regex = None
+        if pattern:
+            try:
+                regex = re.compile(pattern, re.IGNORECASE)
+            except re.error:
+                # Fallback to plain substring
+                regex = None
+
+        def match(text):
+            if not pattern:
+                return True
+            if regex:
+                return bool(regex.search(text))
+            return pattern.lower() in text.lower()
+
+        for i in range(self.props_tree.topLevelItemCount()):
+            parent = self.props_tree.topLevelItem(i)
+            visible_children = 0
+            for j in range(parent.childCount()):
+                child = parent.child(j)
+                key = child.text(0)
+                val = child.text(1)
+                is_match = match(key) or match(val)
+                child.setHidden(not is_match)
+                if is_match:
+                    visible_children += 1
+            parent.setHidden(visible_children == 0)
+            parent.setExpanded(visible_children > 0)
+
+    def collect_visible_properties(self):
+        """Collect currently visible key: value pairs from the tree."""
+        lines = []
+        for i in range(self.props_tree.topLevelItemCount()):
+            parent = self.props_tree.topLevelItem(i)
+            if parent.isHidden():
+                continue
+            for j in range(parent.childCount()):
+                child = parent.child(j)
+                if not child.isHidden():
+                    lines.append(f"{child.text(0)}: {child.text(1)}")
+        return "\n".join(lines)
+
+    # Copy/Export actions
+
+    def copy_overview(self):
+        """Copy overview section."""
+        lines = []
+        for field in self.overview_fields:
+            val = self.overview_labels[field].text()
+            if val:
+                lines.append(f"{field}: {val}")
+        self.copy_to_clipboard("\n".join(lines) if lines else "No overview data.")
+
+    def copy_filtered_properties(self):
+        """Copy only currently visible (filtered) properties."""
+        content = self.collect_visible_properties()
+        if not content and hasattr(self, 'all_properties'):
+            content = self.all_properties
+        self.copy_to_clipboard(content or "No properties.")
 
     def copy_all_properties(self):
         """Copy all device properties to clipboard."""
@@ -476,12 +650,30 @@ class PartitionDumper(QWidget):
         else:
             self.copy_to_clipboard("Properties not loaded yet")
 
+    def export_properties(self):
+        """Export filtered (or all if no filter) to a file."""
+        default_name = "device_properties.txt"
+        path, _ = QFileDialog.getSaveFileName(self, "Export Properties", default_name, "Text Files (*.txt);;All Files (*)")
+        if not path:
+            return
+        content = self.collect_visible_properties() or getattr(self, 'all_properties', '')
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            # Optional: update status on partition tab if present
+            if hasattr(self, 'status_label'):
+                self.status_label.setText(f"Status: Exported properties to {path}")
+        except Exception as e:
+            if hasattr(self, 'status_label'):
+                self.status_label.setText(f"Status: Export failed - {str(e)}")
+
+    # ...existing code...
+
     def copy_to_clipboard(self, text):
         """Cross-platform clipboard copy function."""
         try:
             clipboard = QApplication.clipboard()
             clipboard.setText(text)
-            
             # Update status if we're on partition tab
             if hasattr(self, 'status_label'):
                 self.status_label.setText("Status: Copied to clipboard")
