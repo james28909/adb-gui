@@ -5,7 +5,7 @@ import shlex
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QTreeWidget, QTreeWidgetItem, 
                              QLabel, QFileDialog, QLineEdit, QGroupBox, QTabWidget,
-                             QTextEdit, QSplitter, QScrollArea)
+                             QTextEdit, QSplitter, QScrollArea, QListWidget)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 
@@ -109,59 +109,64 @@ class PartitionDumper(QWidget):
         copy_all_button.clicked.connect(self.copy_all_properties)
         layout.addWidget(copy_all_button)
         
-        # Create splitter for organized property categories
+        # Create scroll area for property lists
+        scroll_area = QScrollArea()
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout(scroll_widget)
+        
+        # Create splitter for organized property lists
         splitter = QSplitter(Qt.Horizontal)
         
-        # Property categories
-        self.property_categories = {
-            "Device Identity": [
-                "ro.product.model", "ro.product.manufacturer", "ro.product.brand",
-                "ro.product.device", "ro.serialno", "ro.product.board"
-            ],
-            "System Version": [
-                "ro.build.version.release", "ro.build.version.sdk", "ro.build.id",
-                "ro.build.type", "ro.build.fingerprint", "ro.build.date"
-            ],
-            "Custom ROM": [
-                "ro.lineage.version", "ro.lineage.device", "ro.lineage.releasetype",
-                "ro.lineage.build.vendor_security_patch"
-            ],
-            "Security & Debug": [
-                "ro.debuggable", "ro.secure", "ro.crypto.state", "ro.build.tags"
-            ],
-            "Hardware & Features": [
-                "ro.product.cpu.abi", "ro.treble.enabled", "ro.vndk.lite",
-                "ro.fastbootd.available"
-            ],
-            "Connectivity": [
-                "sys.usb.config", "sys.usb.state", "persist.sys.usb.config"
-            ]
-        }
+        # Property lists will be populated dynamically
+        self.property_lists = {}
         
-        # Create text widgets for each category
-        self.category_widgets = {}
-        for category, props in self.property_categories.items():
-            group = QGroupBox(category)
-            group_layout = QVBoxLayout()
-            
-            # Text area for this category
-            text_widget = QTextEdit()
-            text_widget.setFont(QFont("Courier", 9))
-            text_widget.setMaximumHeight(200)
-            
-            # Copy button for this category
-            copy_button = QPushButton(f"Copy {category}")
-            copy_button.clicked.connect(lambda checked, cat=category: self.copy_category(cat))
-            
-            group_layout.addWidget(text_widget)
-            group_layout.addWidget(copy_button)
-            group.setLayout(group_layout)
-            
-            self.category_widgets[category] = text_widget
-            splitter.addWidget(group)
+        splitter_widget = QWidget()
+        splitter_layout = QHBoxLayout(splitter_widget)
+        splitter_layout.addWidget(splitter)
         
-        layout.addWidget(splitter)
+        scroll_layout.addWidget(splitter_widget)
+        scroll_area.setWidget(scroll_widget)
+        scroll_area.setWidgetResizable(True)
+        layout.addWidget(scroll_area)
+        
+        # Store references for later use
+        self.splitter = splitter
+        
         self.device_info_tab.setLayout(layout)
+
+    def create_property_list(self, category_name, properties):
+        """Create a scrollable list widget for a property category."""
+        group = QGroupBox(category_name)
+        group_layout = QVBoxLayout()
+        
+        # List widget for properties
+        list_widget = QListWidget()
+        list_widget.setFont(QFont("Courier", 9))
+        list_widget.setMaximumHeight(300)
+        
+        # Add properties to list
+        for prop in properties:
+            list_widget.addItem(prop)
+        
+        # Copy button for this category
+        copy_button = QPushButton(f"Copy {category_name}")
+        copy_button.clicked.connect(lambda checked, cat=category_name: self.copy_property_list(cat))
+        
+        group_layout.addWidget(list_widget)
+        group_layout.addWidget(copy_button)
+        group.setLayout(group_layout)
+        
+        self.property_lists[category_name] = list_widget
+        return group
+
+    def copy_property_list(self, category):
+        """Copy specific property list to clipboard."""
+        list_widget = self.property_lists[category]
+        items = []
+        for i in range(list_widget.count()):
+            items.append(list_widget.item(i).text())
+        content = '\n'.join(items)
+        self.copy_to_clipboard(content)
 
     def setup_output_directory_section(self):
         """Setup the output directory selection UI components."""
@@ -412,7 +417,7 @@ class PartitionDumper(QWidget):
             self.resize(800, 600)
 
     def load_device_info(self):
-        """Load device properties and populate category widgets."""
+        """Load device properties and organize by ro.* subkeys."""
         try:
             # Get all properties
             result = subprocess.run(['adb', 'shell', 'getprop'], 
@@ -425,33 +430,44 @@ class PartitionDumper(QWidget):
                 if line.startswith('[') and ']: [' in line:
                     key = line.split(']: [')[0][1:]
                     value = line.split(']: [')[1].rstrip(']')
-                    props_dict[key] = value
+                    props_dict[key] = f"{key}: {value}"
             
-            # Populate each category
-            for category, prop_keys in self.property_categories.items():
-                text_widget = self.category_widgets[category]
-                content = []
-                
-                for prop_key in prop_keys:
-                    if prop_key in props_dict:
-                        content.append(f"{prop_key}: {props_dict[prop_key]}")
-                    else:
-                        content.append(f"{prop_key}: <not found>")
-                
-                text_widget.setPlainText('\n'.join(content))
+            # Organize properties by ro.* subkeys
+            organized_props = {}
+            for key, formatted_prop in props_dict.items():
+                if key.startswith('ro.'):
+                    # Extract the subkey (e.g., "ro.product" from "ro.product.model")
+                    parts = key.split('.')
+                    if len(parts) >= 2:
+                        subkey = f"{parts[0]}.{parts[1]}"  # e.g., "ro.product"
+                        if subkey not in organized_props:
+                            organized_props[subkey] = []
+                        organized_props[subkey].append(formatted_prop)
+                else:
+                    # Non-ro properties go in "Other"
+                    if "Other" not in organized_props:
+                        organized_props["Other"] = []
+                    organized_props["Other"].append(formatted_prop)
+            
+            # Clear existing widgets from splitter
+            for i in reversed(range(self.splitter.count())):
+                child = self.splitter.widget(i)
+                if child:
+                    child.setParent(None)
+            
+            # Create list widgets for each category
+            for category in sorted(organized_props.keys()):
+                properties = sorted(organized_props[category])
+                group_widget = self.create_property_list(category, properties)
+                self.splitter.addWidget(group_widget)
             
             # Store all properties for full copy function
             self.all_properties = all_props
             
         except subprocess.CalledProcessError as e:
-            for widget in self.category_widgets.values():
-                widget.setPlainText(f"Error loading properties: {str(e)}")
-
-    def copy_category(self, category):
-        """Copy specific category properties to clipboard."""
-        text_widget = self.category_widgets[category]
-        content = text_widget.toPlainText()
-        self.copy_to_clipboard(content)
+            # Create error display
+            error_group = self.create_property_list("Error", [f"Error loading properties: {str(e)}"])
+            self.splitter.addWidget(error_group)
 
     def copy_all_properties(self):
         """Copy all device properties to clipboard."""
