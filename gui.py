@@ -1,11 +1,13 @@
 import os
 import sys
 import subprocess
+import shlex
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QPushButton, QTreeWidget, QTreeWidgetItem, QCheckBox, 
-                             QLabel, QFileDialog, QLineEdit, QGroupBox)
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QScreen
+                             QPushButton, QTreeWidget, QTreeWidgetItem, 
+                             QLabel, QFileDialog, QLineEdit, QGroupBox, QTabWidget,
+                             QTextEdit, QSplitter, QScrollArea)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QFont
 
 class PartitionDumper(QWidget):
     """
@@ -52,6 +54,29 @@ class PartitionDumper(QWidget):
         self.setWindowTitle("ADB Partition Dumper")
         self.layout = QVBoxLayout()
         
+        # Create tab widget
+        self.tab_widget = QTabWidget()
+        
+        # Partition dumper tab
+        self.partition_tab = QWidget()
+        self.setup_partition_tab()
+        self.tab_widget.addTab(self.partition_tab, "Partition Dumper")
+        
+        # Device info tab
+        self.device_info_tab = QWidget()
+        self.setup_device_info_tab()
+        self.tab_widget.addTab(self.device_info_tab, "Device Info")
+        
+        self.layout.addWidget(self.tab_widget)
+        self.setLayout(self.layout)
+        
+        self.load_partitions()
+        self.load_device_info()
+
+    def setup_partition_tab(self):
+        """Setup the original partition dumper interface."""
+        layout = QVBoxLayout()
+        
         # Output directory section
         self.setup_output_directory_section()
         
@@ -62,19 +87,81 @@ class PartitionDumper(QWidget):
         
         # Dump button
         self.dump_button = QPushButton("Dump Selected Partitions")
+        self.dump_button.clicked.connect(self.dump_partitions)
         
         # Status label
         self.status_label = QLabel("Status: Ready")
         
         # Add widgets to layout
-        self.layout.addWidget(self.output_group)
-        self.layout.addWidget(self.list_widget)
-        self.layout.addWidget(self.dump_button)
-        self.layout.addWidget(self.status_label)
+        layout.addWidget(self.output_group)
+        layout.addWidget(self.list_widget)
+        layout.addWidget(self.dump_button)
+        layout.addWidget(self.status_label)
         
-        self.setLayout(self.layout)
-        self.dump_button.clicked.connect(self.dump_partitions)
-        self.load_partitions()
+        self.partition_tab.setLayout(layout)
+
+    def setup_device_info_tab(self):
+        """Setup device information display with organized categories."""
+        layout = QVBoxLayout()
+        
+        # Top button for copying all getprop output
+        copy_all_button = QPushButton("Copy All Device Properties to Clipboard")
+        copy_all_button.clicked.connect(self.copy_all_properties)
+        layout.addWidget(copy_all_button)
+        
+        # Create splitter for organized property categories
+        splitter = QSplitter(Qt.Horizontal)
+        
+        # Property categories
+        self.property_categories = {
+            "Device Identity": [
+                "ro.product.model", "ro.product.manufacturer", "ro.product.brand",
+                "ro.product.device", "ro.serialno", "ro.product.board"
+            ],
+            "System Version": [
+                "ro.build.version.release", "ro.build.version.sdk", "ro.build.id",
+                "ro.build.type", "ro.build.fingerprint", "ro.build.date"
+            ],
+            "Custom ROM": [
+                "ro.lineage.version", "ro.lineage.device", "ro.lineage.releasetype",
+                "ro.lineage.build.vendor_security_patch"
+            ],
+            "Security & Debug": [
+                "ro.debuggable", "ro.secure", "ro.crypto.state", "ro.build.tags"
+            ],
+            "Hardware & Features": [
+                "ro.product.cpu.abi", "ro.treble.enabled", "ro.vndk.lite",
+                "ro.fastbootd.available"
+            ],
+            "Connectivity": [
+                "sys.usb.config", "sys.usb.state", "persist.sys.usb.config"
+            ]
+        }
+        
+        # Create text widgets for each category
+        self.category_widgets = {}
+        for category, props in self.property_categories.items():
+            group = QGroupBox(category)
+            group_layout = QVBoxLayout()
+            
+            # Text area for this category
+            text_widget = QTextEdit()
+            text_widget.setFont(QFont("Courier", 9))
+            text_widget.setMaximumHeight(200)
+            
+            # Copy button for this category
+            copy_button = QPushButton(f"Copy {category}")
+            copy_button.clicked.connect(lambda checked, cat=category: self.copy_category(cat))
+            
+            group_layout.addWidget(text_widget)
+            group_layout.addWidget(copy_button)
+            group.setLayout(group_layout)
+            
+            self.category_widgets[category] = text_widget
+            splitter.addWidget(group)
+        
+        layout.addWidget(splitter)
+        self.device_info_tab.setLayout(layout)
 
     def setup_output_directory_section(self):
         """Setup the output directory selection UI components."""
@@ -99,7 +186,7 @@ class PartitionDumper(QWidget):
         self.output_group.setLayout(output_layout)
 
     def browse_output_directory(self):
-        """Open a folder selection dialog and update the path field."""
+        """Open a folder selection dialog and update the path field with device-specific subfolder."""
         current_path = self.get_resolved_output_path()
         
         # Use current directory if the resolved path doesn't exist
@@ -114,7 +201,13 @@ class PartitionDumper(QWidget):
         )
         
         if selected_dir:
-            self.output_path_edit.setText(selected_dir)
+            # Get device info and create default subfolder
+            device_name, serial = self.get_device_info()
+            default_folder_name = self.create_default_folder_name(device_name, serial)
+            
+            # Set path to include the device-specific subfolder
+            device_specific_path = os.path.join(selected_dir, default_folder_name)
+            self.output_path_edit.setText(device_specific_path)
 
     def get_resolved_output_path(self):
         """
@@ -166,39 +259,17 @@ class PartitionDumper(QWidget):
             self.status_label.setText(f"Status: Error creating directory - {str(e)}")
             return False
 
-    def load_partitions(self):
-        """
-        Loads partition information from an Android device via ADB and populates a QTreeWidget.
-        This method executes a shell command on the connected Android device to retrieve partition
-        information including partition names, actual names, and sizes. The command iterates through
-        MMC block device partitions and extracts metadata from the kernel's sysfs interface.
-        The retrieved data is parsed and each valid partition is added as a QTreeWidgetItem to the
-        GUI's tree widget, displaying:
-        - Partition name (from PARTNAME in uevent)
-        - Size in megabytes (converted from 512-byte sectors)
-        - Default status of "Pending"
-        - Unchecked checkbox state
-        Args:
-            None
-        Returns:
-            None
-            - Updates self.status_label.setText() if partition loading fails
-            - Populates self.list_widget with QTreeWidgetItem objects for each partition
-            - Each item has checkbox functionality (initially unchecked)
-        Raises:
-            No explicit exceptions raised, but handles:
-            - subprocess failures (non-zero return code)
-            - ValueError when parsing size information
-        Assumptions:
-            - Android device is connected and accessible via ADB
-            - Device has MMC storage (/sys/block/mmcblk0/*)
-            - GUI contains 'status_label' and 'list_widget' attributes
-            - ADB is installed and available in system PATH
-        Note:
-            The method assumes MMC block device naming convention (mmcblk0p*) which is
-            standard for most Android devices but may not work on all device types.
-        """
+    def create_default_folder_name(self, device_name, serial):
+        """Create a safe folder name from device name and serial"""
+        # Remove invalid characters and replace spaces with underscores
+        safe_name = "".join(c for c in device_name if c.isalnum() or c in (' ', '-', '_')).strip()
+        safe_name = safe_name.replace(' ', '_')
+        safe_serial = "".join(c for c in serial if c.isalnum() or c in ('-', '_')).strip()
+        
+        return f"{safe_name}_{safe_serial}"
 
+    def load_partitions(self):
+        """Loads partition information from an Android device via ADB and populates a QTreeWidget."""
         # Single command that outputs: partition_name|actual_name|size_bytes
         cmd = '''for part in /sys/block/mmcblk0/mmcblk0p*; do 
             name=$(grep ^PARTNAME= "$part/uevent" 2>/dev/null | cut -d= -f2)
@@ -309,11 +380,11 @@ class PartitionDumper(QWidget):
         status_height = self.status_label.sizeHint().height()
         
         # Get actual layout spacing and margins
-        actual_spacing = self.layout.spacing()
+        actual_spacing = self.partition_tab.layout().spacing()
         if actual_spacing == -1:  # Default spacing
             actual_spacing = 6  # Qt default
         
-        layout_margins = self.layout.contentsMargins()
+        layout_margins = self.partition_tab.layout().contentsMargins()
         margin_height = layout_margins.top() + layout_margins.bottom()
         
         # Only 2 spacing gaps between 3 widgets
@@ -326,73 +397,122 @@ class PartitionDumper(QWidget):
         total_height = (tree_widget_height + button_height + status_height + 
                        total_spacing + margin_height + title_bar_height)
         
-        # Debug output to see exact calculations
-        print(f"Fixed resize calculation:")
-        print(f"  Row count: {row_count} (was using {row_count - 1})")
-        print(f"  Header height: {header_height}")
-        print(f"  Row height: {row_height} x {row_count} = {rows_height}")
-        print(f"  Tree frame: {tree_frame}")
-        print(f"  Tree widget total: {tree_widget_height}")
-        print(f"  Button: {button_height}")
-        print(f"  Status: {status_height}")
-        print(f"  Spacing: {total_spacing} ({actual_spacing} x 2)")
-        print(f"  Layout margins: {margin_height}")
-        print(f"  Title bar: {title_bar_height}")
-        print(f"  Total height: {total_height}")
-        print(f"  Width calculation:")
-        print(f"    Columns: {total_column_width}")
-        print(f"    Frame: {frame_width}")
-        print(f"    Scrollbar space: {scrollbar_width}")
-        print(f"    Window margins: {window_margins}")
-        print(f"    Total width: {total_width}")
-        
         # Don't exceed screen size
-        screen = QApplication.primaryScreen().geometry()
-        max_width = int(screen.width() * 0.9)
-        max_height = int(screen.height() * 0.9)
-        
-        final_width = min(total_width, max_width)
-        final_height = min(total_height, max_height)
-        
-        print(f"  Final size: {final_width} x {final_height}")
-        
-        self.resize(final_width, final_height)
+        try:
+            screen = QApplication.primaryScreen().geometry()
+            max_width = int(screen.width() * 0.9)
+            max_height = int(screen.height() * 0.9)
+            
+            final_width = min(total_width, max_width)
+            final_height = min(total_height, max_height)
+            
+            self.resize(final_width, final_height)
+        except:
+            # Fallback if screen detection fails
+            self.resize(800, 600)
+
+    def load_device_info(self):
+        """Load device properties and populate category widgets."""
+        try:
+            # Get all properties
+            result = subprocess.run(['adb', 'shell', 'getprop'], 
+                                  capture_output=True, text=True, check=True)
+            all_props = result.stdout
+            
+            # Parse properties into dictionary
+            props_dict = {}
+            for line in all_props.strip().split('\n'):
+                if line.startswith('[') and ']: [' in line:
+                    key = line.split(']: [')[0][1:]
+                    value = line.split(']: [')[1].rstrip(']')
+                    props_dict[key] = value
+            
+            # Populate each category
+            for category, prop_keys in self.property_categories.items():
+                text_widget = self.category_widgets[category]
+                content = []
+                
+                for prop_key in prop_keys:
+                    if prop_key in props_dict:
+                        content.append(f"{prop_key}: {props_dict[prop_key]}")
+                    else:
+                        content.append(f"{prop_key}: <not found>")
+                
+                text_widget.setPlainText('\n'.join(content))
+            
+            # Store all properties for full copy function
+            self.all_properties = all_props
+            
+        except subprocess.CalledProcessError as e:
+            for widget in self.category_widgets.values():
+                widget.setPlainText(f"Error loading properties: {str(e)}")
+
+    def copy_category(self, category):
+        """Copy specific category properties to clipboard."""
+        text_widget = self.category_widgets[category]
+        content = text_widget.toPlainText()
+        self.copy_to_clipboard(content)
+
+    def copy_all_properties(self):
+        """Copy all device properties to clipboard."""
+        if hasattr(self, 'all_properties'):
+            self.copy_to_clipboard(self.all_properties)
+        else:
+            self.copy_to_clipboard("Properties not loaded yet")
+
+    def copy_to_clipboard(self, text):
+        """Cross-platform clipboard copy function."""
+        try:
+            clipboard = QApplication.clipboard()
+            clipboard.setText(text)
+            
+            # Update status if we're on partition tab
+            if hasattr(self, 'status_label'):
+                self.status_label.setText("Status: Copied to clipboard")
+                
+        except Exception as e:
+            if hasattr(self, 'status_label'):
+                self.status_label.setText(f"Status: Copy failed - {str(e)}")
+
+    def get_device_info(self):
+        """Get device name and serial for folder naming"""
+        try:
+            # Get device serial
+            result = subprocess.run(['adb', 'get-serialno'], 
+                                  capture_output=True, text=True, check=True)
+            serial = result.stdout.strip()
+            
+            # Try to get device model from the loaded properties
+            if hasattr(self, 'all_properties'):
+                # Parse for ro.product.model
+                for line in self.all_properties.split('\n'):
+                    if 'ro.product.model' in line and ']: [' in line:
+                        device_name = line.split(']: [')[1].rstrip(']')
+                        if device_name and device_name != 'unknown':
+                            return device_name, serial
+            
+            # Fallback to original method
+            device_props = [
+                'ro.product.model',
+                'ro.product.name', 
+                'ro.product.device'
+            ]
+            
+            device_name = "Unknown"
+            for prop in device_props:
+                result = subprocess.run(['adb', 'shell', f'getprop {prop}'], 
+                                      capture_output=True, text=True, check=True)
+                value = result.stdout.strip()
+                if value and value.lower() not in ['unknown', '', 'android']:
+                    device_name = value
+                    break
+            
+            return device_name, serial
+        except subprocess.CalledProcessError:
+            return "Unknown", "Unknown"
 
     def dump_partitions(self):
-        """
-        Dumps selected partitions from an Android device to image files.
-        
-        This method iterates through all top-level items in the list widget,
-        identifies which partitions are checked/selected, and creates binary
-        dumps of those partitions using ADB commands.
-        
-        The function performs the following operations:
-        1. Ensures the output directory exists or creates it
-        2. Retrieves all checked partitions from the list widget
-        3. Validates that at least one partition is selected
-        4. For each selected partition:
-           - Updates status label to show current dumping progress
-           - Constructs output filename as "{partition_name}.img"
-           - Executes ADB command to dump partition data using dd
-           - Marks partition as "Done" in the UI
-        5. Updates final status when all dumps are complete
-        
-        The ADB command used reads from /dev/block/by-name/{partition} with
-        4096-byte blocks and redirects output to a local .img file in the
-        specified output directory.
-        
-        Returns:
-            None
-            
-        Side Effects:
-            - Creates .img files in the specified output directory
-            - Updates UI status label and list widget items
-            - Processes Qt events to maintain UI responsiveness
-            
-        Note:
-            Requires ADB connection to Android device with appropriate
-            permissions to read partition block devices.
-        """
+        """Dumps selected partitions with improved error handling."""
         # First ensure output directory exists
         if not self.ensure_output_directory():
             return
@@ -408,13 +528,33 @@ class PartitionDumper(QWidget):
         
         for item in selected_items:
             part = item.text(0)
+            # Sanitize partition name
+            safe_part = "".join(c for c in part if c.isalnum() or c in ('-', '_'))
+            if safe_part != part:
+                self.status_label.setText(f"Status: Invalid partition name: {part}")
+                item.setText(2, "Failed")
+                continue
+                
             self.status_label.setText(f"Dumping {part}...")
             QApplication.processEvents()
+            
             dump_file = os.path.join(output_path, f"{part}.img")
-            if dump_file:
-                cmd = f'adb exec-out dd if=/dev/block/by-name/{part} bs=4096 status=none > "{dump_file}"'
-                subprocess.run(cmd, shell=True)
-                item.setText(2, "Done")
+            
+            try:
+                # Use shlex.quote for proper escaping
+                cmd = f'adb exec-out dd if=/dev/block/by-name/{safe_part} bs=4096 status=none > {shlex.quote(dump_file)}'
+                result = subprocess.run(cmd, shell=True, check=True)
+                
+                # Verify file was created and has content
+                if os.path.exists(dump_file) and os.path.getsize(dump_file) > 0:
+                    item.setText(2, "Done")
+                else:
+                    item.setText(2, "Failed")
+                    
+            except subprocess.CalledProcessError as e:
+                self.status_label.setText(f"Status: Error dumping {part}: {str(e)}")
+                item.setText(2, "Failed")
+                
         self.status_label.setText(f"Status: Dump completed to {output_path}")
 
 if __name__ == "__main__":
