@@ -43,6 +43,9 @@ PyQt5>=5.15.0
 
 2. **Install Python dependencies:**
    ```bash
+   # (Optional) Activate your virtual environment if you are using one:
+   source .venv/bin/activate
+   # Replace '.venv/bin/activate' with your venv path if different
    pip install -r requirements.txt
    ```
 
